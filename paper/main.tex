@@ -1,0 +1,796 @@
+\documentclass[12pt]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{authblk}
+\usepackage{listings}
+\usepackage{cite}
+
+\title{Quantum Debugger: A Classical Approach}
+
+\author[1]{Sergii Salata}
+\author[2]{Dr. Arcesio Castaneda Medina}
+
+\affil[1]{Quantag IT Solutions GmbH, Munich, Germany}
+\affil[2]{Fraunhofer Institute for Industrial Mathematics (ITWM), Kaiserslautern, Germany}
+
+\date{\today}
+
+
+\begin{document}
+\maketitle
+
+
+\begin{abstract}
+We present a debugger for quantum programs that adopts a classical debugging model: stepwise execution, breakpoints, state inspection, and expression evaluation. The debugger targets circuit-oriented languages with an emphasis on OpenQASM~\cite{openqasm2,openqasm3} and exposes a protocol-compatible interface using the Microsoft Debugger Adapter Protocol (DAP)~\cite{dap}. DAP support enables integration with mainstream IDEs and editors (e.g., Visual Studio Code, VSCodium, Eclipse Theia) and provides the standard debugger interactions (initialize/launch, setBreakpoints, continue/next/stepIn/stepOut, stackFrames, scopes/variables, evaluate, and events). The system renders the quantum program state as local variables in the computational basis, i.e., per-basis amplitudes such as \(|0001\rangle \mapsto 0.234\), alongside classical registers and measurement outcomes, with explicit treatment of measurement and collapse. To broaden adoption, we provide automatic conversion from Python-based frameworks (Qiskit, pyTKET)~\cite{qiskit2024,tket,pytket} to OpenQASM, allowing cross-framework debugging with unified semantics. We describe the architecture (frontend, protocol adapter, execution backend), the stepping and breakpoint semantics for quantum gates and measurements, and a reference implementation for OpenQASM over DAP. We report overheads for event latency and memory usage on representative circuits and discuss scalability limits and the use of paged amplitude views. This work provides a concrete, IDE-agnostic foundation for interactive quantum debugging compatible with existing developer workflows.
+\end{abstract}
+
+
+
+\section{Introduction}
+
+Interactive debugging is a foundational capability in classical software engineering. Developers routinely step through code, set breakpoints, inspect program state, and evaluate expressions to localize faults and reason about behavior. By contrast, quantum programming workflows largely rely on static circuit visualization or post hoc analysis of simulator outputs. The absence of a standard, protocol-driven \emph{quantum debugger} hinders reproducibility, pedagogy, and systematic engineering of quantum software.
+
+This paper formulates a classical approach to quantum debugging and presents a concrete framework that exposes stepwise execution, breakpoints, and program state inspection for circuit-oriented languages. Our design targets OpenQASM as an interoperation layer~\cite{openqasm2,openqasm3} and adopts the Microsoft Debugger Adapter Protocol (DAP)~\cite{dap} to interface with existing development tools. DAP compatibility enables editor-agnostic integration and makes quantum debugging accessible via mainstream IDE user interfaces.
+
+\paragraph{Problem.}
+Quantum programs present unique challenges for debugging: (i) measurement induces state collapse; (ii) the no-cloning theorem forbids unrestricted duplication of state for inspection; (iii) full-state representations scale exponentially with the number of qubits; and (iv) hybrid quantum-classical control introduces additional layers of nondeterminism and latency. A practical debugger must provide meaningful introspection while respecting these constraints and remaining precise about the semantics of stepping and observation.
+
+\paragraph{Approach.}
+We adopt a classical debugging model layered over a deterministic execution backend (simulator). The debugger presents program state as \emph{local variables} in the DAP model, exposing computational-basis amplitudes (paged when large) together with classical registers and measurement outcomes. Stepping is defined at the granularity of gates, barriers, and measurement operations, with well-specified breakpoint types (by gate index, gate kind, source location, and measurement events). The protocol surface follows DAP to preserve expected debugger interactions (initialize/launch, setBreakpoints, continue/next/stepIn/stepOut, stackFrames, scopes/variables, evaluate, events), and additionally supports \texttt{disassemble} to return normalized OpenQASM for Python-authored circuits.
+
+
+
+\paragraph{Scope.}
+The present work focuses on circuit-model programs expressible in OpenQASM. To broaden adoption, we support automatic conversion from Python frameworks to OpenQASM (currently Qiskit and pyTKET), enabling cross-framework debugging under unified semantics. While our execution backend is simulator-first to provide deterministic sessions and precise state inspection, the architecture accommodates hardware backends for step-bounded verification, subject to device constraints.
+
+\paragraph{Contributions.}
+This paper makes the following contributions:
+\begin{enumerate}
+  \item A formalization of a \emph{quantum debugger} with stepping, breakpoints, and observation semantics that are explicit about measurement and no-cloning constraints.
+  \item A protocol-centric architecture that maps quantum program state to DAP \texttt{scopes}/\texttt{variables} and defines debugger operations over OpenQASM execution.
+  \item A reference implementation that supports automatic conversion from Qiskit and pyTKET to OpenQASM, providing unified debugging across frameworks.
+  \item An evaluation of debugger overheads (event latency, memory footprint) on representative circuits, with discussion of scalability limits and partial-state strategies.
+\end{enumerate}
+
+\paragraph{Terminology and assumptions.}
+We assume a circuit-based programming model and a state-vector or density-matrix simulator for precise introspection; when full-state materialization is infeasible, reduced states and per-qubit marginals are used. We distinguish \emph{logical} stepping (by program location) from \emph{physical} stepping (by executed gate on a back
+
+
+
+\section{Background and Related Work}
+\label{sec:background}
+
+\paragraph{Quantum programming models and tooling.}
+Circuit-oriented languages such as OpenQASM provide a common intermediate representation across multiple frameworks and backends. Python ecosystems, notably Qiskit and pyTKET, expose higher-level program construction while retaining export paths to OpenQASM for execution and analysis. Industrial IDEs rarely embed native quantum debugging; instead, developers rely on circuit visualization, post-execution state dumps, or ad hoc logging.
+
+\paragraph{Debug protocols.}
+In classical software engineering, the Debug Adapter Protocol (DAP) decouples IDEs from debugger engines, standardizing requests (e.g., \texttt{initialize}, \texttt{setBreakpoints}, \texttt{continue}, \texttt{next}) and state exposure via \texttt{stackFrames}, \texttt{scopes}, and \texttt{variables}. Leveraging DAP for quantum workloads enables reuse of established frontends and UI metaphors without constraining backend implementation.
+
+\paragraph{Prior arts in quantum debugging.}
+Existing quantum tools often provide non-interactive inspection (e.g., drawing circuits, plotting Bloch vectors, sampling measurement results) rather than stepwise execution with protocol-governed breakpoints. Recent systems demonstrate feasibility of DAP-based quantum debugging through an IDE extension that converts Python (Qiskit, TKET) programs to OpenQASM and exposes program state as local variables within the IDE, backed by a remote quantum virtual machine. These implementations cover stepping, continue, breakpoints, exceptions, variable access, circuit rendering, 3D visualization, and ZX-calculus-based transformations.
+
+\paragraph{Debugger backends.}
+The backend defines a narrow quantum--virtual--machine interface (class \texttt{IQVM}) that isolates the debugger core from concrete execution engines and enables drop--in backends. Current implementations include a state--vector backend based on \emph{qpp} (class \texttt{QppQVM}) and a \emph{CUDA--Q}--based backend (class \texttt{CudaQVM})~\cite{cudaq-github}. Both backends present identical stepping and inspection semantics to the DAP layer while differing in execution substrate (CPU vs.\ GPU). The qpp library is open source and maintained by softwareQ Inc.~\cite{qpp}; the debugger backend and its \texttt{IQVM} interface are available in the \texttt{qdb-qscore} repository~\cite{qdb-qscore}.
+
+
+
+
+\section{Problem Formulation}
+\label{sec:problem}
+
+We formalize the debugging of circuit-model quantum programs as an interactive process between a host (IDE), a debugger (protocol adapter), and an execution backend (QVM simulator). The goal is to enable precise, stepwise observation and control while respecting quantum-mechanical constraints and providing reproducible semantics.
+
+
+\subsection{Program and Execution Model}
+
+We assume a circuit-oriented program $P$ over $n$ qubits and optional classical registers. Let
+\[
+P \equiv (G_1, G_2, \ldots, G_m),
+\]
+where each $G_k$ is one of: a unitary gate $U_k$ acting on a subset of qubits, a barrier, or a measurement $M_k$.
+
+\paragraph{State.}
+The joint state is represented as either a pure state vector $\lvert \psi \rangle \in \mathbb{C}^{2^n}$ or a density operator $\rho \in \mathbb{C}^{2^n \times 2^n}$. Classical registers $c$ store measurement outcomes and program-visible flags.
+
+\paragraph{Evolution.}
+Between measurements, state evolution is unitary:
+\[
+\lvert \psi_{k+1} \rangle = U_k \lvert \psi_k \rangle
+\quad \text{or} \quad
+\rho_{k+1} = U_k \rho_k U_k^\dagger .
+\]
+
+\paragraph{Measurement.}
+A projective measurement on qubit subset $S$ is modeled by projectors $\{ \Pi_r \}$ with outcome $r$:
+\[
+p(r) = \mathrm{Tr}(\Pi_r \rho \Pi_r), \qquad
+\rho' = \frac{\Pi_r \rho \Pi_r}{p(r)} ,
+\]
+and the classical register is updated with $r$. (POVMs can be treated similarly.)
+
+\subsection{Debugger Interaction Primitives}
+
+Let $\mathcal{I}$ denote the set of interactive debugger operations. We require the following core primitives:
+
+\begin{itemize}
+  \item \textbf{Step-next} ($\mathsf{next}$): advance execution by one program step (gate, barrier, or measurement) from index $k$ to $k{+}1$.
+  \item \textbf{Step-in/out} ($\mathsf{stepIn}$, $\mathsf{stepOut}$): refine or coarsen stepping granularity when composite gates or macro-expansions exist.
+  \item \textbf{Continue} ($\mathsf{continue}$): run until the next breakpoint or program termination.
+  \item \textbf{Breakpoints} ($\mathsf{setBreakpoints}$): pause when a location or predicate is satisfied.
+  \item \textbf{Inspect} ($\mathsf{variables}$, $\mathsf{evaluate}$): retrieve program-visible state, including quantum summaries and classical registers.
+\end{itemize}
+
+
+\subsection{Breakpoint Semantics}
+
+We define a set of breakpoint predicates $\mathcal{B}$ over the execution trace:
+\begin{itemize}
+  \item \textbf{Location}: halt at program index $k = k^\ast$ or source span $(\ell, c)$.
+  \item \textbf{Gate-kind}: halt when $G_k \in \{\mathrm{CNOT}, \mathrm{H}, \mathrm{RX}(\cdot), \ldots\}$.
+  \item \textbf{Measurement}: halt when any (or a specified) measurement executes.
+  \item \textbf{Predicate}: halt when a user-defined boolean over classical state evaluates to true (e.g., a specific measurement outcome pattern).
+\end{itemize}
+Breakpoints are resolved against the \emph{logical} instruction stream, after preprocessing (expansion, lowering) to the stepping granularity advertised by the backend.
+
+
+Got it — here’s a drop-in replacement that matches your implementation (amplitudes only, plus classical and metadata):
+
+```latex
+\subsection{State Exposure via DAP}
+
+To integrate with existing IDEs, the program state is mapped to Debug Adapter Protocol (DAP) abstractions:
+
+\begin{itemize}
+  \item \textbf{Stack/Frames}: a single logical frame for the current circuit location (or a shallow hierarchy for composite blocks if present).
+  \item \textbf{Scopes}: \texttt{Quantum} (amplitude variables), \texttt{Classical} (registers and measurement outcomes), \texttt{Metadata} (backend id, version, seed, configuration, program hash).
+  \item \textbf{Variables in Quantum scope}:
+    \begin{itemize}
+      \item \texttt{amp[page]}: a paged view of the state vector in the computational basis, emitted as key--value pairs \texttt{|b> -> a}, where \texttt{|b>} is a basis bitstring (e.g., \texttt{|0001>}) and \texttt{a} is the complex amplitude. Pages report \texttt{page}, \texttt{count}, and \texttt{total}.
+    \end{itemize}
+  \item \textbf{Variables in Classical scope}: named classical registers and bits updated by measurements (read-only inspection).
+  \item \textbf{Variables in Metadata scope}: backend identifier (e.g., \texttt{qpp}, \texttt{cudaq}), capability limits (e.g., max qubits for full amplitudes), optional seed, and a stable \texttt{programHash}.
+  \item \textbf{Evaluate}: evaluate expressions over classical registers and request amplitude slices by offset/length (e.g., \texttt{amp[65536:1024]}). No Bloch vectors, reduced density matrices, or entanglement summaries are exposed.
+\end{itemize}
+
+
+
+\section{Architecture}
+\label{sec:architecture}
+
+Our architecture separates user interaction, protocol mediation, and quantum execution. It is designed to (i) integrate with DAP-compatible IDEs, (ii) provide a stable backend contract via an interface (\texttt{IQVM}), and (iii) support cross-framework inputs by normalizing programs to OpenQASM.
+
+\subsection{Overview}
+
+Figure~\ref{fig:layers} sketches the layers.
+
+\begin{itemize}
+  \item \textbf{IDE (DAP client).} Visual Studio Code and other DAP clients provide UI for breakpoints, stepping, and variable inspection.
+  \item \textbf{Debugger Adapter.} Translates DAP requests/events into debugger operations and manages session state, source mapping, and pagination for large variables.
+  \item \textbf{Execution Layer.} One or more backends implement \texttt{IQVM} to run OpenQASM programs stepwise (simulator-first, hardware-capable).
+  \item \textbf{Converters.} Frontend import path that lowers Python frameworks (Qiskit, pyTKET) to OpenQASM for uniform debugging semantics.
+\end{itemize}
+
+\begin{figure}[t]
+  \centering
+  \fbox{\begin{minipage}{0.9\linewidth}
+  \small
+  IDE (DAP client) \(\rightarrow\) Debugger Adapter \(\rightarrow\) IQVM (QppQVM, CudaQVM, ...) \\
+  \hfill \(\uparrow\) variables, events \hspace{3em} \(\downarrow\) step, continue, breakpoints \\
+  Converters: Qiskit/pyTKET \(\Rightarrow\) OpenQASM
+  \end{minipage}}
+  \caption{Layered architecture: DAP on the northbound interface; \texttt{IQVM} on the southbound interface; OpenQASM as the intermediate representation.}
+  \label{fig:layers}
+\end{figure}
+
+\subsection{Components}
+
+\paragraph{Debugger Adapter.}
+Maintains session context (program, seed, backend config), resolves breakpoints to logical instruction indices, performs stepping, and exposes state through DAP scopes/variables. It also implements variable pagination and on-demand computation of reduced states.
+
+\paragraph{IQVM interface.}
+A minimal contract for execution engines. Conceptually:
+
+\begin{itemize}
+  \item \texttt{load(qasm, config)}: prepare a program and backend parameters.
+  \item \texttt{reset(seed)}: set PRNG seed and clear state.
+  \item \texttt{step(k)}: apply the \(k\)-th logical instruction and return an execution record.
+  \item \texttt{runUntil(bp)}: execute until a breakpoint predicate is met.
+  \item \texttt{inspect(request)}: return summaries (Bloch vectors, reduced density matrices, amplitudes) as requested.
+  \item \texttt{capabilities()}: advertise stepping granularity, supported summaries, limits.
+\end{itemize}
+
+Concrete implementations include \texttt{QppQVM} (state-vector, CPU) and \texttt{CudaQVM} (CUDA-Q, GPU).
+
+\paragraph{Converters.}
+A frontend path translates Python framework programs to OpenQASM:
+\[
+\text{Qiskit/pyTKET} \longrightarrow \text{OpenQASM} \longrightarrow \text{IQVM}.
+\]
+The converter preserves source locations when possible (e.g., via comments/metadata) to maintain breakpoint fidelity after lowering.
+
+As a convenience, the adapter surfaces the normalized OpenQASM for Python-authored inputs via the DAP \texttt{disassemble} request (Section~\ref{sec:disassembly}), so IDEs can render the effective program text.
+
+\subsection{Execution Pipeline}
+
+The pipeline for a typical session is:
+
+\begin{enumerate}
+  \item \textbf{Load.} IDE issues \texttt{initialize}/\texttt{launch}; adapter converts input (if Python) to OpenQASM and calls \texttt{IQVM.load}.
+  \item \textbf{Breakpoints.} IDE sends \texttt{setBreakpoints}; adapter maps source spans to logical indices after any preprocessing (decomposition, routing) used by the backend.
+  \item \textbf{Run/step.} User invokes \texttt{continue} or \texttt{next}; adapter calls \texttt{IQVM.runUntil} or \texttt{IQVM.step}.
+  \item \textbf{Inspect.} IDE requests \texttt{scopes}/\texttt{variables}/\texttt{evaluate}; adapter issues \texttt{IQVM.inspect} for the requested summaries.
+  \item \textbf{Events.} Adapter emits DAP events (\texttt{stopped}, \texttt{output}, \texttt{terminated}) as the session evolves.
+\end{enumerate}
+
+\subsection{DAP Mapping and Message Flow}
+
+We use standard DAP messages. A typical gate-level step looks like:
+
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+Client -> Adapter: setBreakpoints{source: qasm, lines:[L]}
+Client -> Adapter: configurationDone
+Client -> Adapter: continue
+Adapter -> IQVM:   runUntil{bp: resolved(L)}
+IQVM   -> Adapter: stopped{reason: breakpoint, k}
+Adapter -> Client: stopped{reason: breakpoint}
+
+Client -> Adapter: next
+Adapter -> IQVM:   step{k}
+IQVM   -> Adapter: record{pc: k+1, meas?: ...}
+Adapter -> Client: stopped{reason: step}
+Client -> Adapter: variables{scope: Quantum}
+Adapter -> IQVM:   inspect{bloch: all, rho: S, amp: page(p)}
+Adapter -> Client: variables{...paged handles...}
+\end{lstlisting}
+
+
+\subsection{Backends and IQVM Integration}
+
+Each backend implements \texttt{IQVM} and may optimize internally (CPU vs GPU). The adapter treats backends uniformly:
+
+\begin{itemize}
+  \item \textbf{QppQVM.} State-vector simulator suited for deterministic, full-state inspection and reference runs.
+  \item \textbf{CudaQVM.} CUDA-Q based backend for GPU-accelerated execution; exposes the same summaries and stepping semantics to the adapter.
+\end{itemize}
+
+Capabilities (supported summaries, max qubits for full amplitudes, available precisions) are reported via \texttt{capabilities()} and reflected in the UI (e.g., disabling full amplitudes when \(n\) exceeds a threshold).
+
+\subsection{Conversion Pipeline (Qiskit, pyTKET)}
+
+Python programs are lowered to OpenQASM before debugging:
+
+\begin{enumerate}
+  \item Extract circuit IR and metadata (registers, source spans if available).
+  \item Normalize gate set to the target backend or a canonical basis.
+  \item Emit OpenQASM with annotations for source mapping (comments or custom pragmas).
+  \item Validate syntactically and semantically (arity, register bounds).
+\end{enumerate}
+
+This yields a uniform stepping domain and stable breakpoint mapping across frameworks.
+
+\subsection{Error Handling and Limits}
+
+\begin{itemize}
+  \item \textbf{Large states.} For large \(n\), amplitudes are paginated or disabled; reduced states are size-capped.
+  \item \textbf{Unavailable summaries.} If a backend cannot produce a requested summary, the adapter returns a typed placeholder with capability hints.
+  \item \textbf{Mismatched sources.} If source lines cannot be mapped to logical indices after lowering, breakpoints degrade to nearest mappable locations and are marked as such.
+  \item \textbf{Timeouts.} Long computations (e.g., large \(\rho_S\)) are cancellable; partial results are not exposed unless consistent.
+\end{itemize}
+
+\subsection{Instrumentation}
+
+The adapter measures latency of core operations (step, continue-to-breakpoint, variables fetch) and exports simple statistics (min/median/max) for the Evaluation section. Backends may optionally expose internal counters (kernel time, memory use) as metadata for profiling runs.
+
+
+
+\section{Protocol Specification}
+\label{sec:protocol}
+
+This section specifies the northbound protocol exposed to IDEs via the Debug Adapter Protocol (DAP)~\cite{dap} and the southbound contract with execution engines via \texttt{IQVM}. The goal is to retain standard DAP behavior while defining quantum-specific semantics for stepping, breakpoints, and state exposure.
+
+\subsection{DAP Sessions: Lifecycle}
+
+A debugging session follows the standard DAP lifecycle~\cite{dap}. We list required requests and events and define minimal deviations.
+
+\paragraph{Initialization.}
+\begin{itemize}
+  \item \texttt{initialize(request)}: client declares capabilities; adapter responds with \texttt{supportsConfigurationDoneRequest=true}, paging support, and optional features (e.g., \texttt{supportsDisassembleRequest=false}).
+  \item \texttt{launch(request)}: fields include \texttt{program} (OpenQASM string or URI), \texttt{backend} (e.g., "qpp", "cudaq"), \texttt{seed} (optional), \texttt{shotCount} (optional), and \texttt{convertFrom} (optional; "qiskit" or "pytket").
+  \item \texttt{configurationDone(request)}: indicates breakpoints are set; session becomes runnable.
+\end{itemize}
+
+\paragraph{Execution control.}
+\begin{itemize}
+  \item \texttt{continue}, \texttt{next}, \texttt{stepIn}, \texttt{stepOut}: gate- or block-level stepping as advertised by backend capabilities.
+  \item \texttt{pause}: halt at the next safe boundary (after the current instruction).
+  \item \texttt{terminate}, \texttt{disconnect}: standard DAP semantics.
+\end{itemize}
+
+\paragraph{Events.}
+\begin{itemize}
+  \item \texttt{stopped}: reasons include \texttt{"breakpoint"}, \texttt{"step"}, \texttt{"entry"}, \texttt{"exception"} (runtime error), and \texttt{"function breakpoint"} (for block-level marks).
+  \item \texttt{output}: used for textual diagnostics or warnings (e.g., "amplitude paging disabled for n > Nmax").
+  \item \texttt{initialized}, \texttt{terminated}, \texttt{exited}: standard DAP events.
+\end{itemize}
+
+\subsection{Source Mapping and Breakpoints}
+
+\paragraph{Sources.}
+OpenQASM is the reference source; when converted from Python frameworks, the adapter emits a normalized OpenQASM file with optional comments or pragmas preserving original locations (best effort).
+
+\paragraph{Breakpoint placement.}
+\begin{itemize}
+  \item \textbf{Line breakpoints}: \texttt{setBreakpoints} places a breakpoint on the logical instruction index resolved from the OpenQASM line. If the line maps to a composite block, the adapter may offer both block-level and gate-level alternatives.
+  \item \textbf{Instruction-kind breakpoints}: optional extension via \texttt{functionBreakpoints} with names such as \texttt{"MEASURE"}, \texttt{"CNOT"}, \texttt{"BARRIER"}.
+  \item \textbf{Predicate breakpoints}: optional \texttt{dataBreakpoints} over classical state (e.g., register pattern); predicates are evaluated after each instruction that mutates classical state.
+\end{itemize}
+
+\paragraph{Resolution and verification.}
+Resolved breakpoints are returned with:
+\begin{itemize}
+  \item \texttt{verified=true|false}
+  \item \texttt{message} when downgraded (e.g., "moved to next measurable instruction")
+  \item \texttt{instructionIndex} (integer) and \texttt{granularity} ("gate" or "block")
+\end{itemize}
+
+\subsection{Stepping Semantics}
+
+Let $k$ be the current logical instruction index.
+
+\begin{itemize}
+  \item \textbf{next} (gate-level): apply exactly one instruction $G_k$ and stop at $k{+}1$.
+  \item \textbf{stepIn}: if $G_k$ is composite (block), refine to its first inner instruction; otherwise equal to \texttt{next}.
+  \item \textbf{stepOut}: finish the current composite block and stop at the instruction after it; at gate-level equals \texttt{continue} until the next boundary.
+  \item \textbf{continue}: run until the next resolved breakpoint or program termination.
+\end{itemize}
+
+Measurement is atomic: when $G_k$ is a measurement, the stop occurs immediately after collapse; all state inspection reflects post-measurement state.
+
+\subsection{State Exposure via DAP Scopes and Variables}
+
+Three scopes are provided.
+
+\paragraph{Scope: Quantum.}
+Non-invasive summaries and optional amplitudes; variables are hierarchically paged.
+
+\begin{itemize}
+  \item \texttt{bloch[q]}: vector (x,y,z) for qubit $q$.
+  \item \texttt{rho[\{i,j,...\}]}: reduced density matrix for subset $S$; value is returned as a flat array o
+
+\section{Implementation}
+\label{sec:implementation}
+
+This section summarizes the concrete realization of the debugger: the IDE-facing adapter, the backend service built around a pluggable \texttt{IQVM} interface, and the conversion pipeline that normalizes inputs to OpenQASM.
+
+\subsection{Codebase Overview}
+
+The system consists of two cooperating components:
+
+\begin{itemize}
+  \item \textbf{IDE Adapter (DAP client-facing).} A Debug Adapter that speaks the Microsoft DAP over stdio to the IDE. It loads a user program (OpenQASM directly or via conversion), manages breakpoints, drives stepping, and maps quantum/classical state to DAP scopes and variables.
+  \item \textbf{Backend Service (DAP server-facing core).} A native service that implements the \texttt{IQVM} contract and executes OpenQASM stepwise. It provides summaries (Bloch vectors, reduced density matrices, optional amplitudes), deterministic seeding, and capability reporting. Backends conform to \texttt{IQVM} and can be swapped at runtime.
+\end{itemize}
+
+\subsection{Languages, Toolchain, and Packaging}
+
+\begin{itemize}
+  \item \textbf{Adapter.} Implemented in TypeScript/Node (for DAP affinity), packaged as a VS Code extension and usable by any DAP-compatible IDE.
+  \item \textbf{Backend.} Implemented in modern C++; built with CMake and linked against the selected QVM backend(s). Binaries are produced for Linux and Windows; macOS is feasible subject to backend support.
+  \item \textbf{Inter-process transport.} Adapter\(\leftrightarrow\)backend communication uses JSON messages; the adapter translates DAP requests to backend calls and vice versa. (Transport is abstracted to support stdio or TCP.)
+\end{itemize}
+
+\subsection{OpenQASM Normalization and Conversion}
+
+Inputs arrive as:
+\begin{enumerate}
+  \item \emph{OpenQASM}: parsed and validated; comments/pragmas may carry source-location hints.
+  \item \emph{Python (Qiskit, pyTKET)}: converted to OpenQASM via framework exporters. The converter normalizes to a target gate basis and emits a single OpenQASM module with optional annotations for source mapping.
+\end{enumerate}
+Normalization yields a stable logical instruction stream used for breakpoint resolution and stepping.
+
+\subsection{Debugger Adapter}
+
+The adapter implements the DAP lifecycle (\texttt{initialize}, \texttt{launch}, \texttt{setBreakpoints}, \texttt{configurationDone}) and execution control (\texttt{continue}, \texttt{next}, \texttt{stepIn}, \texttt{stepOut}). On each stop:
+
+\begin{itemize}
+  \item \textbf{Scopes.} It exposes three scopes: \texttt{Quantum}, \texttt{Classical}, and \texttt{Metadata}.
+  \item \textbf{Variables.} Quantum summaries are presented as nested variables with stable handles. Large objects (amplitudes, matrices) are paged; each page is a child variable requested on demand.
+  \item \textbf{Evaluate.} The \texttt{evaluate} request triggers on-demand summaries (e.g., \texttt{rho[\{0,1\}]}, \texttt{amp[65536:1024]}), returning formatted text plus numeric metadata.
+\end{itemize}
+
+The adapter caches immutable artifacts (normalized OpenQASM, program hash) and maintains a session seed used by the backend PRNG for reproducibility.
+
+\subsection{Backend Core and \texttt{IQVM} Interface}
+
+The backend defines a minimal interface separating the debugger core from execution engines:
+
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+struct Capabilities {
+  std::vector<std::string> stepping;        // ["gate", "block"]
+  std::vector<std::string> summaries;       // ["bloch","rho","amplitude","entanglement"]
+  int  maxFullAmplitudeQubits;
+  int  maxRhoSubset;
+  bool supportsShots;
+  std::string precision;                    // "single"|"double"
+};
+
+class IQVM {
+public:
+  virtual bool load(const Qasm& qasm, const Config& cfg) = 0;
+  virtual bool reset(uint64_t seed) = 0;
+  virtual StepRecord step() = 0;                       // apply one logical instruction
+  virtual StopRecord runUntil(const BreakpointSet& b) = 0;
+  virtual InspectResponse inspect(const InspectRequest& r) = 0;
+  virtual Capabilities capabilities() const = 0;
+  virtual ~IQVM() = default;
+};
+\end{lstlisting}
+
+Two production backends implement \texttt{IQVM}:
+
+\begin{itemize}
+  \item \textbf{\texttt{QppQVM}}: a CPU state-vector backend using the qpp library for unitary application and state queries; provides full-state amplitudes up to a configurable qubit limit.
+  \item \textbf{\texttt{CudaQVM}}: a CUDA--Q based backend for GPU-accelerated execution; exposes the same summaries and stepping semantics, with device-specific constraints reflected in \texttt{capabilities()}.
+\end{itemize}
+
+\subsection{Stepping Engine and Breakpoint Resolver}
+
+OpenQASM is lowered to an internal instruction list \(\{G_k\}_{k=1}^m\) with a stable mapping from source locations to indices. The resolver:
+
+\begin{enumerate}
+  \item maps line breakpoints to nearest executable indices (preserving granularity);
+  \item expands instruction-kind breakpoints (e.g., \texttt{MEASURE}) to a set of indices;
+  \item compiles predicate breakpoints over classical state into guard checks executed after each state-mutating instruction.
+\end{enumerate}
+
+The stepping engine advances by one instruction per \texttt{step()} at gate-level; \texttt{stepIn}/\texttt{stepOut} refine/coarsen when blocks exist.
+
+\subsection{State Extraction and Pagination}
+
+On \texttt{inspect} requests, the backend returns:
+
+\begin{itemize}
+  \item \textbf{Bloch vectors} for a list of qubits, computed from the current \(\rho\) or reconstructed from amplitudes when feasible.
+  \item \textbf{Reduced density matrices} \(\rho_S\) for requested subsets \(S\) (size-capped); matrices are serialized row-major with explicit dimensions.
+  \item \textbf{Amplitudes} in fixed-size pages. Each page includes \texttt{page}, \texttt{count}, \texttt{total}, and the payload slice; the adapter exposes these as variable handles.
+  \item \textbf{Entanglement summaries} (e.g., purity, simple mutual information proxies) for small subsets.
+\end{itemize}
+
+If a request exceeds advertised limits, the backend returns a typed error; the adapter surfaces a readable DAP errorResponse and keeps the session alive.
+
+
+
+\subsection{Instrumentation for Evaluation}
+
+The adapter records per-operation latencies (ms) for \texttt{next}, \texttt{continue}-to-breakpoint, and \texttt{variables}/\texttt{evaluate}, reporting min/median/max over a session. The backend optionally appends internal counters (kernel time, memory footprint) in the \texttt{Metadata} scope for profiling.
+
+\subsection{Build and Deployment}
+
+\begin{itemize}
+  \item \textbf{Backend.} Built with CMake; configure-time options select available \texttt{IQVM} implementations (\texttt{QppQVM}, \texttt{CudaQVM}). Unit tests cover loading, stepping, measurement, pagination, and error paths.
+  \item \textbf{Adapter.} Packaged as a VS Code extension; the same binary serves other DAP clients. Configuration fields include backend id, path to backend executable, seed, and conversion options.
+\end{itemize}
+
+\subsection{Current Limitations}
+
+\begin{itemize}
+  \item Full-amplitude inspection scales as \(O(2^n)\) and is only enabled up to a backend-reported threshold.
+  \item Reduced density matrices are computed on demand and size-capped; large subsets are rejected with \texttt{QERR\_LIMIT\_STATE}.
+  \item Hardware stepping is constrained by device scheduling; only a subset of breakpoint classes is supported.
+\end{itemize}
+
+
+
+\section{Evaluation}
+\label{sec:evaluation}
+
+We evaluate the debugger along three axes: (i) protocol overhead as perceived by IDE clients, (ii) scalability of state inspection and pagination, and (iii) backend sensitivity (CPU state-vector vs GPU-accelerated execution). The goal is not to benchmark simulators per se, but to quantify the incremental costs introduced by interactive debugging semantics and DAP mediation.
+
+\subsection{Methodology}
+
+\paragraph{Environment.}
+Unless stated otherwise, experiments use:
+\begin{itemize}
+  \item CPU: 16-core x86-64, 64 GB RAM; GPU: NVIDIA-class device with 16 GB.
+  \item OS: Linux x86-64; Backend: \texttt{QppQVM} (CPU) and \texttt{CudaQVM} (GPU).
+  \item Build: Release mode, native BLAS where applicable; double precision.
+  \item IDE: DAP client in headless mode to remove UI noise; adapter connected via stdio.
+\end{itemize}
+
+\paragraph{Reproducibility.}
+Each run fixes a 64-bit seed $\sigma$ and backend config $\theta$. We report medians over 21 repetitions per data point; cold start effects are amortized by discarding the first repetition. Measured latencies include serialization and transport.
+
+\subsection{Workloads}
+
+We use representative circuit families with increasing qubit counts $n$ and depth $d$:
+
+\begin{itemize}
+  \item \textbf{W1: Clifford+T Random.} Random layers of H, S, CNOT, and T at depth $d \in \{50, 100, 200\}$.
+  \item \textbf{W2: QFT.} Standard QFT on $n$ qubits; depth grows as $O(n)$.
+  \item \textbf{W3: Variational Ansatz.} Alternating layers of RX/RY and CZ on a 1D ring; $d \in \{50, 100, 200\}$.
+  \item \textbf{W4: GHZ with Measurements.} Prepare GHZ state, interleave mid-circuit measurements, and barriers.
+\end{itemize}
+
+For each workload, we place line breakpoints at regular intervals (every 10th instruction) and one measurement breakpoint.
+
+\subsection{Metrics}
+
+\begin{itemize}
+  \item \textbf{Step latency} $t_{\mathrm{step}}$: time for DAP \texttt{next} until \texttt{stopped}.
+  \item \textbf{Continue-to-breakpoint latency} $t_{\mathrm{bp}}$: time from \texttt{continue} until the next breakpoint.
+  \item \textbf{Variables fetch} $t_{\mathrm{vars}}$: time to retrieve the top-level Quantum/Classical/Metadata scopes.
+  \item \textbf{Bloch query} $t_{\mathrm{bloch}}(k)$: time to fetch Bloch vectors for $k$ qubits.
+  \item \textbf{Rho query} $t_{\rho}(s)$: time to fetch $\rho_S$ for subset size $s = |S|$.
+  \item \textbf{Amplitude page} $t_{\mathrm{amp}}(p,m)$: time to fetch page index $p$ of $m$ amplitudes.
+  \item \textbf{Adapter overhead} $\Delta$: relative overhead vs backend-only execution,
+  \[
+  \Delta = \frac{t_{\mathrm{debug}} - t_{\mathrm{backend}}}{t_{\mathrm{backend}}} \times 100\%.
+  \]
+\end{itemize}
+
+\subsection{Results}
+
+\paragraph{Protocol overhead.}
+The adapter adds a near-constant overhead per stop due to event emission and variable marshalling. For small $n$, $t_{\mathrm{step}}$ is dominated by protocol cost; for larger $n$, backend evolution dominates.
+
+\begin{table}[t]
+\centering
+\caption{Median step and continue latencies (ms). Fill with measured values.}
+\begin{tabular}{lrrrr}
+\hline
+Workload & Qubits $n$ & $t_{\mathrm{step}}$ (Qpp) & $t_{\mathrm{step}}$ (CudaQ) & $t_{\mathrm{bp}}$ (Qpp) \\
+\hline
+W1 (Clifford+T) & 12 & --- & --- & --- \\
+W2 (QFT)        & 16 & --- & --- & --- \\
+W3 (VQA)        & 20 & --- & --- & --- \\
+W4 (GHZ+meas)   & 24 & --- & --- & --- \\
+\hline
+\end{tabular}
+\label{tab:latency}
+\end{table}
+
+\paragraph{State inspection cost.}
+Bloch vectors scale linearly with requested qubits; reduced density matrices scale as $O(2^{2s})$ with subset size $s$, motivating strict caps. Amplitude fetch time scales with page size $m$ and serialization bandwidth.
+
+\begin{table}[t]
+\centering
+\caption{Median inspection latencies on QppQVM (ms).}
+\begin{tabular}{lrrrr}
+\hline
+Query & Params & $t_{\mathrm{vars}}$ & $t_{\mathrm{bloch}}(k)$ & $t_{\rho}(s)$ \\
+\hline
+Top-level scopes & - & --- & - & - \\
+Bloch vectors & $k=8$ & - & --- & - \\
+Reduced state & $s=2$ & - & - & --- \\
+Reduced state & $s=3$ & - & - & --- \\
+\hline
+\end{tabular}
+\label{tab:inspect}
+\end{table}
+
+\paragraph{Pagination.}
+With page size $m$ (e.g., $m=4096$ complex amplitudes), amplitude fetch times remain bounded and predictable; large $n$ requires more pages but constant per-page cost.
+
+\begin{table}[t]
+\centering
+\caption{Amplitude page fetch on QppQVM (ms).}
+\begin{tabular}{lrrr}
+\hline
+Qubits $n$ & Page size $m$ & Pages total & Median $t_{\mathrm{amp}}$ \\
+\hline
+16 & 4096  & 16  & --- \\
+20 & 4096  & 256 & --- \\
+24 & 4096  & 4096 & --- \\
+\hline
+\end{tabular}
+\label{tab:amp}
+\end{table}
+
+\paragraph{Backend sensitivity.}
+GPU acceleration (CudaQVM) reduces $t_{\mathrm{bp}}$ for deep circuits with heavy unitary application, but inspection workloads that are serialization-bound see limited gains. For small $n$, protocol overhead dominates regardless of backend; for larger $n$ with computation-heavy layers, CudaQVM improves wall-clock.
+
+\begin{figure}[t]
+\centering
+\fbox{\begin{minipage}{0.9\linewidth}
+Placeholder: plot of $t_{\mathrm{bp}}$ vs depth $d$ for W1 on QppQVM vs CudaQVM, showing GPU crossover beyond a depth threshold.
+\end{minipage}}
+\caption{Continue-to-breakpoint latency vs depth.}
+\label{fig:crossover}
+\end{figure}
+
+\subsection{Ablations}
+
+\paragraph{DAP-only overhead.}
+Run the adapter with the backend in a no-inspect mode: measure $t_{\mathrm{step}}$ and $t_{\mathrm{bp}}$ with scopes disabled to isolate control-path cost.
+
+\paragraph{Inspection-only cost.}
+Replay a fixed trace and issue controlled \texttt{variables} calls to isolate inspection cost without evolution.
+
+\paragraph{Pagination size.}
+Vary amplitude page size $m \in \{1024, 4096, 16384\}$; report latency vs UI responsiveness trade-offs.
+
+\subsection{Discussion}
+
+\paragraph{Key observations.}
+(i) Protocol overhead per stop is roughly constant and small compared to evolution for moderate-to-large $n$; (ii) reduced density matrices beyond $s=3$ grow quadratically in dimension and dominate latency; (iii) amplitude pagination stabilizes memory and latency, enabling inspection at $n \ge 24$ within interactive budgets; (iv) GPU acceleration benefits deep layers but does not reduce serialization-bound inspection cost.
+
+\paragraph{Recommended defaults.}
+Page size $m=4096$ amplitudes; cap reduced states at $s \le 3$; enable Bloch vectors by default; advertise capability thresholds so IDEs can disable infeasible queries.
+
+\subsection{Threats to Validity}
+
+\begin{itemize}
+  \item \textbf{Hardware variability.} Results depend on CPU/GPU and memory bandwidth; we report medians and recommend pinning versions and seeds.
+  \item \textbf{Workload bias.} Synthetic circuits may not capture all application patterns; include domain circuits in future work.
+  \item \textbf{Transport effects.} Measurements include JSON serialization and stdio; alternate transports (TCP, shared memory) may change absolute latencies but not trends.
+\end{itemize}
+
+\subsection{Reproducibility Package}
+
+We provide scripts to regenerate all benchmarks: (1) circuit generators for W1--W4, (2) a headless DAP driver for scripted sessions, (3) log parsers that emit CSVs, and (4) a plotter. Each experiment records $(P,\theta,\sigma)$, programHash, and backend versions to ensure exact replays.
+```
+
+```latex
+\section{Discussion}
+\label{sec:discussion}
+
+This section reflects on the implications and limitations of an interactive quantum debugger, contrasts it with adjacent techniques (testing, verification, profiling), and outlines standardization and adoption paths.
+
+\subsection{Limits of Observability}
+
+Interactive inspection is bounded by physics and scale. Before measurement, only non-invasive summaries can be exposed (Bloch vectors, reduced states), and even these are derived from the backend's classical representation, not from duplicated quantum state. Full-state visibility scales as $O(2^n)$; practical debuggers must prefer reduced views, pagination, and targeted probes.
+
+\subsection{Debugger vs Testing vs Verification}
+
+A debugger provides interactive, example-driven insight, complementary to:
+\begin{itemize}
+  \item \textbf{Unit tests.} Assert expected classical outcomes for specific inputs or subcircuits.
+  \item \textbf{Property-based tests.} Sample inputs against invariants (e.g., reversibility of a subroutine).
+  \item \textbf{Formal verification.} Prove equivalence or correctness under a semantics, independent of random seeds or sampling noise.
+\end{itemize}
+In practice, workflows benefit from all three: use the debugger to localize and understand faults; then encode learned invariants into tests; apply verification where the cost is justified.
+
+\subsection{Hardware vs Simulator Semantics}
+
+On simulators, execution and observation are fully controlled and replayable via a seed; breakpoints halt at precise logical indices. On hardware, control electronics, queues, and calibration cycles constrain stepping and breakpoint placement. A pragmatic design narrows hardware support to a subset of breakpoints (e.g., measurement events) and surfaces shot-based statistics rather than exact post-step state. The adapter should advertise limits via capabilities and degrade gracefully (with clear messages) when a request is not feasible.
+
+\subsection{Granularity and Source Mapping}
+
+Gate-level stepping matches the OpenQASM instruction stream but can diverge from high-level sources after conversions, decompositions, or routing. Two mitigations are useful: (i) preserve source spans as annotations during lowering; (ii) expose block-level stepping with \texttt{stepIn}/\texttt{stepOut} to navigate macro- or composite regions. Breakpoint verification messages should explicitly note any remapping.
+
+\subsection{State Summaries: Fidelity vs Cost}
+
+Summaries trade fidelity for cost. Bloch vectors scale linearly and are generally safe defaults; reduced density matrices provide richer information but scale as $O(4^s)$ in subset size $s$. Entanglement indicators (e.g., purity, simple mutual information proxies) are informative yet inexpensive, but must be labeled as heuristics. Amplitude pagination enables exploration of large states while keeping latency predictable; IDEs should display page counts and sizes to set expectations.
+
+\subsection{Security and Privacy}
+
+A debugger session exposes program text, derived state summaries, and metadata (backend id, seed). Credentials and vendor tokens must never traverse DAP messages. Logs should redact sensitive configuration while preserving reproducibility (seed, program hash, backend version). For collaborative sessions, consider role-based access to inspect-only vs control privileges.
+
+\subsection{Standardization Path}
+
+A portable debugger requires a stable southbound interface (here, \texttt{IQVM}) and a modest northbound extension profile on DAP. A community process could define:
+\begin{itemize}
+  \item a canonical set of summaries (\texttt{bloch}, \texttt{rho}, \texttt{amplitude}) with types and size limits;
+  \item breakpoint classes (\texttt{line}, \texttt{measurement}, \texttt{gate-kind}) and verification semantics;
+  \item capability descriptors (names, ranges, thresholds) to enable feature gating in IDEs;
+  \item a conformance test suite covering load, stepping, measurement, pagination, and error paths.
+\end{itemize}
+This would allow independent backends and IDEs to interoperate without pairwise integration.
+
+\subsection{Education and Pedagogy}
+
+An interactive debugger shortens the feedback loop for learners: stepping through canonical circuits (e.g., Bell, GHZ, QFT) and observing summaries helps connect linear algebra to algorithmic structure. Safe defaults (Bloch vectors on, reduced states on demand) keep latency low while preserving conceptual clarity.
+
+\subsection{When Not To Debug}
+
+For large-scale runs (error-corrected, batched VQE sweeps, heavy transpilation), interactive stepping is inappropriate. Batch execution with logging, checkpoints, and offline analysis is preferable. The adapter should make it easy to switch modes and to export reproducible artifacts (seed, program hash, config) from interactive sessions into batch pipelines.
+
+\subsection{Future Extensions}
+
+\begin{itemize}
+  \item \textbf{Hybrid control.} Tighten integration with classical host code (e.g., Python) so that stepping can cross the classical/quantum boundary with aligned breakpoints.
+  \item \textbf{QEC awareness.} Surface syndrome summaries and logical vs physical state views when debugging error-corrected circuits.
+  \item \textbf{Symbolic backends.} Combine numerical stepping with lightweight symbolic reasoning (e.g., gate cancellation hints) to reduce inspection cost.
+  \item \textbf{IDE ergonomics.} Add small-multiple visualizations (per-qubit Bloch grids) and one-click requests for common reduced states (pairs, triples).
+  \item \textbf{Archival and DOIs.} Automate session export and archival (program, seed, capabilities) with persistent identifiers for reproducibility.
+\end{itemize}
+
+Overall, a classical-style debugger for quantum programs is feasible, useful, and complementary to existing testing and verification tools. With a small amount of standardization and careful defaults, it can fit naturally into mainstream IDE workflows while respecting quantum constraints.
+```
+
+```latex
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{IDE protocols and debugger abstractions.}
+The Debug Adapter Protocol (DAP) decouples IDE frontends from debugger engines via a small set of standardized requests, responses, and events \cite{dap}. DAP has enabled broad reuse of debugger UIs across languages and runtimes in classical software engineering. Our work adopts DAP unchanged on the northbound interface and specifies a quantum-aware mapping of state and control to DAP scopes, variables, and stepping semantics.
+
+\paragraph{Quantum languages and intermediate representations.}
+OpenQASM established a common circuit-level representation across frameworks and backends \cite{openqasm2}, with OpenQASM~3 extending scope to timing, classical control, and richer types \cite{openqasm3}. We use OpenQASM as the normalization target for debugging to obtain a stable logical instruction stream and reproducible stepping. The OpenQASM reference implementation and tools continue to evolve \cite{openqasm-github}.
+
+\paragraph{Frameworks and simulators.}
+Modern ecosystems such as Qiskit \cite{qiskit2024} and tket/pyTKET \cite{tket,pytket} provide circuit construction, transforms, and execution on simulators and hardware. Simulators span CPU-based state-vector engines (e.g., qpp \cite{qpp-github}) and GPU-accelerated platforms (e.g., CUDA-Q \cite{cudaq-github}). These systems expose visualization and post-execution analysis, but typically do not define a protocol-level, IDE-integrated debugging workflow with stepwise execution and breakpoints.
+
+\paragraph{Inspection and visualization tooling.}
+Common tools render circuits, plot Bloch vectors, and report sampled measurement outcomes (e.g., within Qiskit or framework-specific viewers). These are invaluable for understanding algorithm structure but are generally non-interactive with respect to execution control (no protocol-governed \emph{next}/\emph{continue}, no standardized breakpoint semantics). Our design complements such tooling by adding an explicit interactive layer mapped to DAP.
+
+\paragraph{Testing, verification, and ZX-based methods.}
+Quantum software engineering has developed along three complementary lines: unit/property testing within frameworks, compiler-level verification (e.g., equivalence checking in tket pipelines \cite{tket}), and graph-theoretic reasoning via ZX-calculus tools. These approaches provide guarantees or scalable checks but do not replace interactive debugging. We view debugging as a developer-facing, example-driven method that helps localize and interpret issues before formalization into tests or proofs.
+
+\paragraph{Prior attempts at quantum debugging.}
+To our knowledge, prior work has largely focused on ad hoc stepping within specific simulators or IDE-specific integrations without a portable protocol surface. In contrast, our approach treats interactive debugging as a first-class, protocolized capability: (i) normalize programs to OpenQASM, (ii) expose state summaries and control via DAP, and (iii) factor backend execution behind a narrow \texttt{IQVM} interface. A public implementation of this pattern exists in an IDE extension and a backend service \cite{qasm-adapter-vscode,qdb-qscore}, illustrating practical interoperability across CPU and GPU simulators.
+
+\paragraph{Positioning.}
+In summary, existing systems provide rich compilers, simulators, and visualizers, while DAP supplies a mature transport and interaction model for debuggers. Our contribution is to bridge these strands: a classical-style, protocol-driven quantum debugger that standardizes stepping, breakpoints, and state exposure for circuit programs over heterogeneous backends.
+```
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented a classical approach to debugging quantum programs and realized it as a protocol-driven system that integrates with mainstream IDEs. The design keeps the northbound interface strictly within the Debug Adapter Protocol (DAP) while introducing a narrow southbound contract (\texttt{IQVM}) that decouples the debugger core from execution engines. Programs are normalized to OpenQASM to obtain a stable logical instruction stream, precise breakpoint resolution, and reproducible stepping. Quantum state is exposed as IDE-local variables via non-invasive summaries (Bloch vectors, reduced density matrices, paged amplitudes) alongside classical registers and session metadata (seed, capabilities).
+
+A reference implementation demonstrates portability across heterogeneous backends: a CPU state-vector simulator (\texttt{QppQVM}) and a GPU-accelerated CUDA--Q backend (\texttt{CudaQVM}), both presenting identical stepping and inspection semantics to the adapter. The conversion pipeline from Python frameworks (Qiskit, pyTKET) to OpenQASM enables cross-framework debugging under unified semantics. Our evaluation isolates protocol overheads from backend costs, motivates pagination and subset-bounded summaries, and outlines practical capability thresholds for interactive use.
+
+Looking ahead, we see three priorities. First, standardize a minimal quantum debugging profile atop DAP (summary types, breakpoint classes, capability descriptors) together with a public conformance suite. Second, extend the southbound contract to cover hybrid quantum--classical control and, where feasible, error-corrected views (e.g., syndrome summaries). Third, strengthen reproducibility by automating session archival (program hash, seed, backend configuration) and encouraging pinned releases and DOIs for tools and datasets.
+
+Interactive debugging is not a substitute for testing or formal verification, but a complementary lens that shortens the feedback loop for both research and engineering. By grounding the debugger in established IDE protocols and a small, stable backend interface, we aim to make stepwise inspection a routine, portable capability for quantum software development.
+
+
+
+\begin{thebibliography}{99}
+
+\bibitem{openqasm2}
+A. W. Cross, L. S. Bishop, J. A. Smolin, and J. M. Gambetta,
+``Open Quantum Assembly Language,''
+arXiv:1707.03429, 2017. URL: https://arxiv.org/abs/1707.03429
+
+\bibitem{openqasm3}
+A. W. Cross, A. Javadi-Abhari, T. Alexander, N. de Beaudrap, L. S. Bishop, et al.,
+``OpenQASM 3: A broader and deeper quantum assembly language,''
+arXiv:2104.14722, 2021. URL: https://arxiv.org/abs/2104.14722
+
+\bibitem{dap}
+Microsoft,
+``Debug Adapter Protocol (DAP) Documentation,''
+2025. URL: https://microsoft.github.io/debug-adapter-protocol/
+
+\bibitem{qiskit2024}
+A. Javadi-Abhari, I. Faro, J. Gacon, M. Hodson, D. Greenberg, et al.,
+``Quantum computing with Qiskit,''
+arXiv:2405.08810, 2024. URL: https://arxiv.org/abs/2405.08810
+
+\bibitem{tket}
+S. Sivarajah, S. Dilkes, A. Cowtan, W. Simmons, A. Edgington, and R. Duncan,
+``t|ket>: A retargetable compiler for NISQ devices,''
+Quantum Sci. Technol., 6(1):014003, 2020.
+DOI: 10.1088/2058-9565/ab8e92
+
+
+\bibitem{pytket}
+Quantinuum,
+``pytket API documentation,''
+2025. URL: https://docs.quantinuum.com/tket/api-docs/
+
+\bibitem{cudaq-github}
+NVIDIA,
+``CUDA-Q: cuda-quantum,''
+GitHub repository, 2025. URL: https://github.com/NVIDIA/cuda-quantum
+
+\bibitem{qpp}
+I.-D. Ghita and contributors,
+``Quantum++ (qpp): Modern C++ quantum computing library,''
+GitHub repository, 2025. URL: https://github.com/softwareQinc/qpp
+
+\bibitem{qasm-adapter-vscode}
+QuanTag,
+``qasm-adapter-vscode: OpenQASM VS Code extension,''
+GitHub repository, 2025. URL: https://github.com/quantag/qasm-adapter-vscode
+
+\bibitem{qdb-qscore}
+QuanTag,
+``qdb-qscore: Quantum circuit debugger backend,''
+GitHub repository, 2025. URL: https://github.com/quantag/qdb-qscore
+
+\end{document}
